@@ -186,20 +186,32 @@
         const lessonData = typeof nceSentences !== 'undefined' ? nceSentences[lessonNum] : null;
         if (lessonData && lessonData.sentences) {
            let lrcIndex = 0;
-           for (const sentence of lessonData.sentences) {
-              const cleanTarget = sentence.en.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-              for (let j = lrcIndex; j < lrc.length; j++) {
-                 const cleanLrc = lrc[j].en.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-                 if (cleanLrc === cleanTarget) {
-                    matchedSentences[sentence.en] = {
-                       start: lrc[j].time,
-                       end: (j + 1 < lrc.length) ? lrc[j + 1].time : lrc[j].time + 5
-                    };
-                    lrcIndex = j + 1;
-                    break;
-                 }
-              }
-           }
+                   for (const sentence of lessonData.sentences) {
+                      const sentenceEn = sentence.en || sentence.english;
+                      if (!sentenceEn) continue;
+                      const cleanTarget = sentenceEn.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+                      
+                      let matched = false;
+                      for (let j = lrcIndex; j < lrc.length; j++) {
+                         let concatenatedLrc = '';
+                         for (let k = j; k < lrc.length; k++) {
+                             concatenatedLrc += lrc[k].en.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+                             if (concatenatedLrc === cleanTarget) {
+                                matchedSentences[sentenceEn] = {
+                                   start: lrc[j].time,
+                                   end: (k + 1 < lrc.length) ? lrc[k + 1].time : lrc[k].time + 5
+                                };
+                                lrcIndex = k + 1;
+                                matched = true;
+                                break;
+                             }
+                             if (concatenatedLrc.length > cleanTarget.length) {
+                                break;
+                             }
+                         }
+                         if (matched) break;
+                      }
+                   }
         }
         
         this.cache[lessonNum] = { audio, lrc, matchedSentences };
@@ -211,7 +223,8 @@
     },
     
     currentAudioObj: null,
-    audioTimeout: null,
+    audioInterval: null,
+    playId: 0,
     
     async playSentence(text, lessonNum) {
       const lessonData = await this.loadLesson(lessonNum);
@@ -220,39 +233,83 @@
       let match = lessonData.matchedSentences[text];
       if (!match) {
         const cleanTarget = text.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+        let matched = false;
         for (let j = 0; j < lessonData.lrc.length; j++) {
-           const cleanLrc = lessonData.lrc[j].en.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-           if (cleanLrc === cleanTarget) {
-              match = {
-                 start: lessonData.lrc[j].time,
-                 end: (j + 1 < lessonData.lrc.length) ? lessonData.lrc[j + 1].time : lessonData.lrc[j].time + 5
-              };
-              lessonData.matchedSentences[text] = match;
-              break;
+           let concatenatedLrc = '';
+           for (let k = j; k < lessonData.lrc.length; k++) {
+               concatenatedLrc += lessonData.lrc[k].en.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+               if (concatenatedLrc === cleanTarget) {
+                  match = {
+                     start: lessonData.lrc[j].time,
+                     end: (k + 1 < lessonData.lrc.length) ? lessonData.lrc[k + 1].time : lessonData.lrc[k].time + 5
+                  };
+                  lessonData.matchedSentences[text] = match;
+                  matched = true;
+                  break;
+               }
+               if (concatenatedLrc.length > cleanTarget.length) {
+                  break;
+               }
            }
+           if (matched) break;
         }
       }
       
       if (!match) return false;
       
+      const currentPlayId = ++this.playId;
+      
       if (this.currentAudioObj) {
         this.currentAudioObj.pause();
       }
-      if (this.audioTimeout) {
-        clearTimeout(this.audioTimeout);
+      if (this.audioInterval) {
+        clearInterval(this.audioInterval);
+        this.audioInterval = null;
       }
       
       const audio = lessonData.audio;
-      audio.currentTime = match.start;
+      const actualStart = Math.max(0, match.start - 0.15);
+      const actualEnd = match.end - 0.15;
+      
+      if (audio.readyState >= 1) {
+          audio.currentTime = actualStart;
+      } else {
+          await new Promise(resolve => {
+              audio.addEventListener('loadedmetadata', resolve, { once: true });
+              // 兜底：如果元数据加载失败，3秒后强制继续
+              setTimeout(resolve, 3000);
+          });
+          audio.currentTime = actualStart;
+      }
       
       try {
         await audio.play();
+        if (this.playId !== currentPlayId) {
+            audio.pause();
+            return false;
+        }
         this.currentAudioObj = audio;
         
-        this.audioTimeout = setTimeout(() => {
-           audio.pause();
-        }, Math.max((match.end - match.start) * 1000, 1000));
-        return true;
+        return new Promise((resolve) => {
+           this.audioInterval = setInterval(() => {
+               if (audio.currentTime >= actualEnd) {
+                   audio.pause();
+                   clearInterval(this.audioInterval);
+                   this.audioInterval = null;
+                   resolve(true);
+               }
+           }, 30);
+           
+           // 兜底超时
+           setTimeout(() => {
+               if (this.audioInterval) {
+                   audio.pause();
+                   clearInterval(this.audioInterval);
+                   this.audioInterval = null;
+                   resolve(true);
+               }
+           }, (actualEnd - actualStart) * 1000 + 800);
+        });
       } catch(e) {
         console.error("Audio play error", e);
         return false;
@@ -798,10 +855,16 @@
     isPlaying = false;
     clearKeyHighlights();
 
-    $$('.mode-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
     lessonSelector.classList.toggle('show', mode === 'sentences');
-    highlightToggleBar.style.display = (mode === 'favorites') ? 'none' : 'flex';
-    highlightToggleBar.classList.toggle('show-display-toggles', mode === 'sentences');
+    
+    const favModeToggle = $('#favModeToggle');
+    if (favModeToggle) {
+      const isFav = mode === 'favorites';
+      const strong = favModeToggle.querySelector('strong');
+      if (strong) strong.textContent = isFav ? '开' : '关';
+      favModeToggle.classList.toggle('off', !isFav);
+      favModeToggle.classList.toggle('active', isFav);
+    }
 
     score = 0; combo = 0; totalKeys = 0; correctKeys = 0; charCount = 0;
     updateStats();
@@ -845,18 +908,18 @@
   function init() {
     buildLessonSelector();
 
-    const favTab = $('[data-mode="favorites"]');
-    if (favTab) {
+    const favModeToggle = $('#favModeToggle');
+    if (favModeToggle) {
       const badge = document.createElement('span');
       badge.className = 'fav-badge hidden';
       badge.textContent = '0';
-      favTab.appendChild(badge);
+      favModeToggle.appendChild(badge);
+      
+      favModeToggle.addEventListener('click', () => {
+        setMode(currentMode === 'sentences' ? 'favorites' : 'sentences');
+      });
     }
     updateFavBadge();
-
-    $$('.mode-tab').forEach(tab => {
-      tab.addEventListener('click', () => setMode(tab.dataset.mode));
-    });
 
     btnStart.addEventListener('click', startGame);
 
@@ -929,6 +992,8 @@
     document.addEventListener('keydown', (e) => {
       if (e.key === ' ' && isPlaying) e.preventDefault();
     });
+
+    setMode(currentMode);
   }
 
   init();
